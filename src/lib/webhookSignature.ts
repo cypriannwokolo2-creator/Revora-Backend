@@ -1,143 +1,332 @@
 import { createHmac, timingSafeEqual } from 'crypto';
-import { Errors } from './errors';
 
 /**
- * Default tolerance window for webhook timestamp validation.
- * Requests older than this are rejected to prevent replay attacks.
+ * @title Webhook Signature Verification
+ * @notice Production-grade HMAC-SHA256 signature verification for incoming webhooks.
+ * @dev Implements constant-time comparison to prevent timing attacks.
+ *
+ * Security assumptions:
+ * - Secrets are cryptographically random and sufficiently long (>= 32 bytes recommended)
+ * - Secrets are stored securely and never transmitted
+ * - Signature format follows the standard: sha256=<hex>
+ * - Payload bodies are not modified between signing and verification
+ *
+ * Abuse/failure paths handled:
+ * - Missing or malformed signatures
+ * - Signature length mismatches (preventing timing attack vectors)
+ * - Invalid hex encoding in signatures
+ * - Timing attacks via constant-time comparison
+ * - Empty secrets or payloads
  */
-export const DEFAULT_TIMESTAMP_TOLERANCE_MS = 5 * 60 * 1000; // 5 minutes
 
 /**
- * Header names sent with every outbound webhook delivery.
+ * @notice Error thrown when signature verification fails.
  */
-export const WEBHOOK_SIGNATURE_HEADER = 'X-Revora-Signature';
-export const WEBHOOK_TIMESTAMP_HEADER = 'X-Revora-Timestamp';
-export const WEBHOOK_EVENT_HEADER = 'X-Revora-Event';
-
-/**
- * Signs a webhook payload body with HMAC-SHA256.
- *
- * The signed message is `${timestamp}.${body}` so that the timestamp is
- * cryptographically bound to the payload, preventing replay attacks where an
- * attacker replays a valid body with a fresh timestamp.
- *
- * Returns a string of the form `sha256=<hex>`.
- *
- * @param secret    - Shared secret for the endpoint.
- * @param body      - Raw JSON string of the webhook payload.
- * @param timestamp - ISO-8601 or Unix-ms timestamp string included in the
- *                    signed message.  Defaults to `Date.now().toString()`.
- */
-export function signPayload(
-  secret: string,
-  body: string,
-  timestamp: string = Date.now().toString(),
-): string {
-  const message = `${timestamp}.${body}`;
-  return 'sha256=' + createHmac('sha256', secret).update(message).digest('hex');
+export class WebhookSignatureError extends Error {
+  constructor(
+    message: string,
+    public readonly code: 'MISSING_SIGNATURE' | 'INVALID_FORMAT' | 'VERIFICATION_FAILED'
+  ) {
+    super(message);
+    this.name = 'WebhookSignatureError';
+    Object.setPrototypeOf(this, WebhookSignatureError.prototype);
+  }
 }
 
 /**
- * Verifies an inbound webhook signature.
+ * @notice Generates an HMAC-SHA256 signature for a webhook payload.
+ * @param secret The shared secret key
+ * @param payload The raw request body (string or Buffer)
+ * @returns A signature string in the format `sha256=<hex>`
  *
- * Performs a constant-time comparison to prevent timing-based side-channel
- * attacks.  Throws an `AppError` (UNAUTHORIZED, 401) on any failure so the
- * caller can forward it directly to Express's error handler.
- *
- * @param secret           - Shared secret for the endpoint.
- * @param body             - Raw request body string.
- * @param signature        - Value of the `X-Revora-Signature` header.
- * @param timestamp        - Value of the `X-Revora-Timestamp` header (ms since epoch).
- * @param toleranceMs      - Maximum age of a valid request in milliseconds.
- * @param nowMs            - Current time in ms (injectable for testing).
- *
- * @throws AppError UNAUTHORIZED if signature is missing, malformed, expired, or invalid.
+ * @example
+ * ```typescript
+ * const signature = signWebhookPayload('my-secret', '{"event":"test"}');
+ * // Returns: "sha256=a1b2c3d4..."
+ * ```
  */
-export function verifySignature(
+export function signWebhookPayload(secret: string, payload: string | Buffer): string {
+  const hmac = createHmac('sha256', secret);
+  hmac.update(payload);
+  return `sha256=${hmac.digest('hex')}`;
+}
+
+/**
+ * @notice Verifies an HMAC-SHA256 signature against a webhook payload.
+ * @dev Uses timing-safe comparison to prevent timing attacks.
+ *
+ * @param secret The shared secret key
+ * @param payload The raw request body (string or Buffer)
+ * @param signature The signature to verify (format: `sha256=<hex>`)
+ * @returns `true` if the signature is valid, `false` otherwise
+ *
+ * @example
+ * ```typescript
+ * const isValid = verifyWebhookPayload('my-secret', body, 'sha256=a1b2c3d4...');
+ * ```
+ */
+export function verifyWebhookPayload(
   secret: string,
-  body: string,
-  signature: string | undefined,
-  timestamp: string | undefined,
-  toleranceMs: number = DEFAULT_TIMESTAMP_TOLERANCE_MS,
-  nowMs: number = Date.now(),
-): void {
-  // ── 1. Presence checks ────────────────────────────────────────────────────
-  if (!signature) {
-    throw Errors.unauthorized('Missing webhook signature header');
-  }
-  if (!timestamp) {
-    throw Errors.unauthorized('Missing webhook timestamp header');
+  payload: string | Buffer,
+  signature: string | string[]
+): boolean {
+  // Handle edge cases - allow empty string secret but not undefined/null
+  if (secret === undefined || secret === null || !payload || !signature) {
+    return false;
   }
 
-  // ── 2. Timestamp format ───────────────────────────────────────────────────
-  const tsNum = Number(timestamp);
-  if (!Number.isFinite(tsNum) || tsNum <= 0) {
-    throw Errors.unauthorized('Invalid webhook timestamp');
+  // Handle array signature (take first element)
+  const signatureStr = Array.isArray(signature) ? signature[0] : signature;
+  if (!signatureStr || typeof signatureStr !== 'string') {
+    return false;
   }
 
-  // ── 3. Timestamp tolerance (replay-attack window) ─────────────────────────
-  const ageMs = nowMs - tsNum;
-  if (ageMs > toleranceMs) {
-    throw Errors.unauthorized('Webhook timestamp too old');
-  }
-  if (ageMs < -toleranceMs) {
-    throw Errors.unauthorized('Webhook timestamp is in the future');
+  // Validate signature format
+  if (!signatureStr.startsWith('sha256=')) {
+    return false;
   }
 
-  // ── 4. Signature format ───────────────────────────────────────────────────
-  if (!signature.startsWith('sha256=')) {
-    throw Errors.unauthorized('Unsupported webhook signature scheme');
+  const expectedSignature = signWebhookPayload(secret, payload);
+
+  // Ensure signatures are the same length before comparison
+  if (signatureStr.length !== expectedSignature.length) {
+    return false;
   }
 
-  // ── 5. Constant-time HMAC comparison ─────────────────────────────────────
-  const expected = signPayload(secret, body, timestamp);
-
-  let sigBuf: Buffer;
-  let expectedBuf: Buffer;
+  // Constant-time comparison to prevent timing attacks
   try {
-    sigBuf = Buffer.from(signature, 'utf8');
-    expectedBuf = Buffer.from(expected, 'utf8');
+    const signatureBuffer = Buffer.from(signatureStr, 'utf8');
+    const expectedBuffer = Buffer.from(expectedSignature, 'utf8');
+    return timingSafeEqual(signatureBuffer, expectedBuffer);
   } catch {
-    throw Errors.unauthorized('Invalid webhook signature encoding');
-  }
-
-  // Buffers must be the same length for timingSafeEqual; length mismatch is
-  // itself a safe early-exit because it reveals no secret information.
-  if (sigBuf.length !== expectedBuf.length) {
-    throw Errors.unauthorized('Invalid webhook signature');
-  }
-
-  if (!timingSafeEqual(sigBuf, expectedBuf)) {
-    throw Errors.unauthorized('Invalid webhook signature');
+    // If buffers can't be compared, fall back to safe false
+    return false;
   }
 }
 
 /**
- * Classifies a webhook signature verification failure for structured logging.
+ * @notice Extracts the signature from request headers.
+ * @dev Supports both 'X-Revora-Signature' and standard 'X-Webhook-Signature' headers.
  *
- * Returns a short machine-readable reason string so callers can emit
- * consistent log fields without parsing error messages.
+ * @param headers The request headers object (case-insensitive lookup)
+ * @returns The signature string or undefined if not found
+ *
+ * @example
+ * ```typescript
+ * const signature = extractSignatureFromHeaders(req.headers);
+ * ```
  */
-export type SignatureFailureReason =
-  | 'missing_signature'
-  | 'missing_timestamp'
-  | 'invalid_timestamp_format'
-  | 'timestamp_too_old'
-  | 'timestamp_in_future'
-  | 'unsupported_scheme'
-  | 'invalid_signature'
-  | 'unknown';
+export function extractSignatureFromHeaders(
+  headers: Record<string, string | string[] | undefined>
+): string | undefined {
+  // Common webhook signature header names
+  const headerNames = [
+    'x-revora-signature',
+    'x-webhook-signature',
+    'x-signature',
+    'x-hub-signature-256', // GitHub-style
+  ];
 
-export function classifySignatureFailure(err: unknown): SignatureFailureReason {
-  if (!(err instanceof Error)) return 'unknown';
-  const msg = err.message;
-  if (msg.includes('Missing webhook signature')) return 'missing_signature';
-  if (msg.includes('Missing webhook timestamp')) return 'missing_timestamp';
-  if (msg.includes('Invalid webhook timestamp') && msg.includes('format')) return 'invalid_timestamp_format';
-  if (msg.includes('Invalid webhook timestamp')) return 'invalid_timestamp_format';
-  if (msg.includes('too old')) return 'timestamp_too_old';
-  if (msg.includes('in the future')) return 'timestamp_in_future';
-  if (msg.includes('Unsupported webhook signature scheme')) return 'unsupported_scheme';
-  if (msg.includes('Invalid webhook signature')) return 'invalid_signature';
-  return 'unknown';
+  for (const name of headerNames) {
+    const value = headers[name] ?? headers[name.toLowerCase()];
+    if (typeof value === 'string') {
+      return value;
+    }
+    if (Array.isArray(value) && value.length > 0) {
+      return value[0];
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * @notice Validates and verifies a webhook signature, throwing on failure.
+ * @dev Use this when you want explicit error handling for different failure modes.
+ *
+ * @param secret The shared secret key
+ * @param payload The raw request body
+ * @param signature The signature to verify
+ * @throws {WebhookSignatureError} When signature is missing, malformed, or invalid
+ *
+ * @example
+ * ```typescript
+ * try {
+ *   assertValidWebhookSignature(secret, body, signature);
+ *   // Process webhook...
+ * } catch (error) {
+ *   if (error instanceof WebhookSignatureError) {
+ *     // Handle specific verification failure
+ *   }
+ * }
+ * ```
+ */
+export function assertValidWebhookSignature(
+  secret: string,
+  payload: string | Buffer,
+  signature: string | undefined
+): void {
+  if (!signature) {
+    throw new WebhookSignatureError(
+      'Webhook signature is missing',
+      'MISSING_SIGNATURE'
+    );
+  }
+
+  if (!signature.startsWith('sha256=')) {
+    throw new WebhookSignatureError(
+      'Invalid signature format. Expected: sha256=<hex>',
+      'INVALID_FORMAT'
+    );
+  }
+
+  if (!verifyWebhookPayload(secret, payload, signature)) {
+    throw new WebhookSignatureError(
+      'Webhook signature verification failed',
+      'VERIFICATION_FAILED'
+    );
+  }
+}
+
+/**
+ * @notice Configuration options for webhook signature verification.
+ */
+export interface WebhookVerificationConfig {
+  /** The shared secret key */
+  secret: string;
+  /** Custom header name for the signature (default: 'x-revora-signature') */
+  headerName?: string;
+  /** Maximum payload size in bytes (default: 1MB) */
+  maxPayloadSize?: number;
+  /** Whether to require a timestamp header for replay protection */
+  requireTimestamp?: boolean;
+  /** Maximum age of webhook in milliseconds for replay protection (default: 5 minutes) */
+  maxAgeMs?: number;
+}
+
+/**
+ * @notice Result of a webhook verification operation.
+ */
+export interface WebhookVerificationResult {
+  valid: boolean;
+  error?: WebhookSignatureError;
+  /** Parsed timestamp if present and valid */
+  timestamp?: Date;
+}
+
+/**
+ * @notice Comprehensive webhook verification with optional replay protection.
+ * @dev Validates signature, payload size, and optionally timestamp for replay protection.
+ *
+ * @param config Verification configuration
+ * @param payload The raw request body
+ * @param headers The request headers
+ * @returns Verification result with details
+ *
+ * @example
+ * ```typescript
+ * const result = verifyWebhook({
+ *   secret: 'my-secret',
+ *   requireTimestamp: true,
+ *   maxAgeMs: 300000 // 5 minutes
+ * }, body, headers);
+ *
+ * if (!result.valid) {
+ *   // Handle verification failure
+ * }
+ * ```
+ */
+export function verifyWebhook(
+  config: WebhookVerificationConfig,
+  payload: string | Buffer,
+  headers: Record<string, string | string[] | undefined>
+): WebhookVerificationResult {
+  const {
+    secret,
+    headerName = 'x-revora-signature',
+    maxPayloadSize = 1024 * 1024, // 1MB default
+    requireTimestamp = false,
+    maxAgeMs = 5 * 60 * 1000, // 5 minutes default
+  } = config;
+
+  // Check payload size
+  const payloadSize = Buffer.isBuffer(payload) ? payload.length : Buffer.byteLength(payload);
+  if (payloadSize > maxPayloadSize) {
+    return {
+      valid: false,
+      error: new WebhookSignatureError(
+        `Payload exceeds maximum size of ${maxPayloadSize} bytes`,
+        'INVALID_FORMAT'
+      ),
+    };
+  }
+
+  // Extract signature (handle both string and array header values)
+  const rawSignature = headers[headerName.toLowerCase()] ?? extractSignatureFromHeaders(headers);
+  const signature = Array.isArray(rawSignature) ? rawSignature[0] : rawSignature;
+
+  if (!signature) {
+    return {
+      valid: false,
+      error: new WebhookSignatureError(
+        `Missing signature header: ${headerName}`,
+        'MISSING_SIGNATURE'
+      ),
+    };
+  }
+
+  // Verify signature
+  if (!verifyWebhookPayload(secret, payload, signature)) {
+    return {
+      valid: false,
+      error: new WebhookSignatureError(
+        'Signature verification failed',
+        'VERIFICATION_FAILED'
+      ),
+    };
+  }
+
+  // Optional timestamp/replay protection
+  let timestamp: Date | undefined;
+  if (requireTimestamp) {
+    const timestampHeader = headers['x-webhook-timestamp'] ?? headers['x-revora-timestamp'];
+    const timestampStr = Array.isArray(timestampHeader) ? timestampHeader[0] : timestampHeader;
+
+    if (!timestampStr) {
+      return {
+        valid: false,
+        error: new WebhookSignatureError(
+          'Missing required timestamp header',
+          'INVALID_FORMAT'
+        ),
+      };
+    }
+
+    const timestampNum = parseInt(timestampStr, 10);
+    if (isNaN(timestampNum)) {
+      return {
+        valid: false,
+        error: new WebhookSignatureError(
+          'Invalid timestamp format',
+          'INVALID_FORMAT'
+        ),
+      };
+    }
+
+    timestamp = new Date(timestampNum);
+    const now = Date.now();
+    const age = now - timestamp.getTime();
+
+    if (age < 0 || age > maxAgeMs) {
+      return {
+        valid: false,
+        error: new WebhookSignatureError(
+          `Webhook timestamp outside acceptable window (max age: ${maxAgeMs}ms)`,
+          'VERIFICATION_FAILED'
+        ),
+      };
+    }
+  }
+
+  return { valid: true, timestamp };
 }

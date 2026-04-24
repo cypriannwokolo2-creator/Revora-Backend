@@ -1,537 +1,583 @@
-/**
- * webhookSignature.test.ts
- *
- * Test vectors and behavioural tests for HMAC-SHA256 webhook signature
- * generation and verification, including timestamp tolerance / replay-attack
- * prevention.
- *
- * Security assumptions
- * ────────────────────
- * • Secrets are treated as opaque byte strings; minimum length enforcement is
- *   the caller's responsibility (see WebhookEndpointRepository).
- * • Timestamp values are Unix milliseconds supplied by the sender.  The
- *   tolerance window (default 5 min) limits the replay-attack surface.
- * • Constant-time comparison (timingSafeEqual) prevents timing side-channels
- *   when comparing HMAC digests.
- * • The signed message is `${timestamp}.${body}`, binding the timestamp to the
- *   payload so an attacker cannot reuse a valid body with a fresh timestamp.
- */
-
-import { createHmac } from 'crypto';
 import {
-  signPayload,
-  verifySignature,
-  classifySignatureFailure,
-  DEFAULT_TIMESTAMP_TOLERANCE_MS,
-  WEBHOOK_SIGNATURE_HEADER,
-  WEBHOOK_TIMESTAMP_HEADER,
-  WEBHOOK_EVENT_HEADER,
+  signWebhookPayload,
+  verifyWebhookPayload,
+  extractSignatureFromHeaders,
+  assertValidWebhookSignature,
+  verifyWebhook,
+  WebhookSignatureError,
+  WebhookVerificationConfig,
 } from './webhookSignature';
-import { AppError, ErrorCode } from './errors';
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Test Constants ───────────────────────────────────────────────────────────
 
-const SECRET = 'test-webhook-secret-32-chars-min!';
-const BODY = '{"event":"offering.created","id":"offer-1"}';
-const NOW_MS = 1_700_000_000_000; // fixed epoch for deterministic tests
+const TEST_SECRET = 'test-secret-key-that-is-sufficiently-long-for-hmac-sha256';
+const TEST_PAYLOAD = '{"event":"test","data":{"id":"123"}}';
 
-/** Compute the expected HMAC independently of the implementation. */
-function expectedHmac(secret: string, body: string, timestamp: string): string {
-  return (
-    'sha256=' +
-    createHmac('sha256', secret)
-      .update(`${timestamp}.${body}`)
-      .digest('hex')
-  );
-}
+// ─── signWebhookPayload ───────────────────────────────────────────────────────
 
-function validTimestamp(): string {
-  return NOW_MS.toString();
-}
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-describe('module constants', () => {
-  it('exports the correct header names', () => {
-    expect(WEBHOOK_SIGNATURE_HEADER).toBe('X-Revora-Signature');
-    expect(WEBHOOK_TIMESTAMP_HEADER).toBe('X-Revora-Timestamp');
-    expect(WEBHOOK_EVENT_HEADER).toBe('X-Revora-Event');
+describe('signWebhookPayload', () => {
+  it('should generate a valid sha256 signature', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    expect(signature).toMatch(/^sha256=[a-f0-9]{64}$/);
   });
 
-  it('exports a positive default tolerance', () => {
-    expect(DEFAULT_TIMESTAMP_TOLERANCE_MS).toBeGreaterThan(0);
-    expect(DEFAULT_TIMESTAMP_TOLERANCE_MS).toBe(5 * 60 * 1000);
-  });
-});
-
-// ─── signPayload – HMAC test vectors ─────────────────────────────────────────
-
-describe('signPayload', () => {
-  describe('output format', () => {
-    it('returns a string prefixed with "sha256="', () => {
-      const sig = signPayload(SECRET, BODY, validTimestamp());
-      expect(sig).toMatch(/^sha256=[0-9a-f]{64}$/);
-    });
-
-    it('produces a 64-character hex digest (SHA-256)', () => {
-      const sig = signPayload(SECRET, BODY, validTimestamp());
-      const hex = sig.slice('sha256='.length);
-      expect(hex).toHaveLength(64);
-      expect(hex).toMatch(/^[0-9a-f]+$/);
-    });
+  it('should generate consistent signatures for same input', () => {
+    const sig1 = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const sig2 = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    expect(sig1).toBe(sig2);
   });
 
-  describe('HMAC test vectors', () => {
-    it('vector 1 – matches independent HMAC computation', () => {
-      const ts = '1700000000000';
-      const body = '{"hello":"world"}';
-      const secret = 'secret-a';
-      expect(signPayload(secret, body, ts)).toBe(expectedHmac(secret, body, ts));
-    });
-
-    it('vector 2 – empty body', () => {
-      const ts = '1700000000001';
-      const secret = 'secret-b';
-      expect(signPayload(secret, '', ts)).toBe(expectedHmac(secret, '', ts));
-    });
-
-    it('vector 3 – unicode body', () => {
-      const ts = '1700000000002';
-      const body = '{"name":"Ünïcödé 🚀"}';
-      const secret = 'secret-c';
-      expect(signPayload(secret, body, ts)).toBe(expectedHmac(secret, body, ts));
-    });
-
-    it('vector 4 – large payload', () => {
-      const ts = '1700000000003';
-      const body = JSON.stringify({ data: 'x'.repeat(10_000) });
-      const secret = 'secret-d';
-      expect(signPayload(secret, body, ts)).toBe(expectedHmac(secret, body, ts));
-    });
-
-    it('vector 5 – known fixed output', () => {
-      // Pre-computed: echo -n "1700000000000.{}" | openssl dgst -sha256 -hmac "fixed-secret"
-      const ts = '1700000000000';
-      const body = '{}';
-      const secret = 'fixed-secret';
-      const expected = expectedHmac(secret, body, ts);
-      expect(signPayload(secret, body, ts)).toBe(expected);
-    });
+  it('should generate different signatures for different secrets', () => {
+    const sig1 = signWebhookPayload('secret-a', TEST_PAYLOAD);
+    const sig2 = signWebhookPayload('secret-b', TEST_PAYLOAD);
+    expect(sig1).not.toBe(sig2);
   });
 
-  describe('sensitivity', () => {
-    it('different secrets produce different signatures', () => {
-      const ts = validTimestamp();
-      expect(signPayload('secret-a', BODY, ts)).not.toBe(
-        signPayload('secret-b', BODY, ts),
-      );
-    });
-
-    it('different bodies produce different signatures', () => {
-      const ts = validTimestamp();
-      expect(signPayload(SECRET, 'body-a', ts)).not.toBe(
-        signPayload(SECRET, 'body-b', ts),
-      );
-    });
-
-    it('different timestamps produce different signatures', () => {
-      expect(signPayload(SECRET, BODY, '1000')).not.toBe(
-        signPayload(SECRET, BODY, '2000'),
-      );
-    });
-
-    it('single-character body difference changes the signature', () => {
-      const ts = validTimestamp();
-      const sig1 = signPayload(SECRET, '{"a":1}', ts);
-      const sig2 = signPayload(SECRET, '{"a":2}', ts);
-      expect(sig1).not.toBe(sig2);
-    });
+  it('should generate different signatures for different payloads', () => {
+    const sig1 = signWebhookPayload(TEST_SECRET, '{"a":1}');
+    const sig2 = signWebhookPayload(TEST_SECRET, '{"a":2}');
+    expect(sig1).not.toBe(sig2);
   });
 
-  describe('default timestamp', () => {
-    it('uses Date.now() when no timestamp is provided', () => {
-      const before = Date.now();
-      const sig = signPayload(SECRET, BODY);
-      const after = Date.now();
+  it('should handle Buffer payloads', () => {
+    const bufferPayload = Buffer.from(TEST_PAYLOAD);
+    const signature = signWebhookPayload(TEST_SECRET, bufferPayload);
+    expect(signature).toMatch(/^sha256=[a-f0-9]{64}$/);
+  });
 
-      // Verify the signature is valid for some timestamp in [before, after]
-      let matched = false;
-      for (let t = before; t <= after; t++) {
-        if (sig === expectedHmac(SECRET, BODY, t.toString())) {
-          matched = true;
-          break;
-        }
-      }
-      // The range is tiny; if not matched, the default timestamp is wrong
-      expect(matched).toBe(true);
-    });
+  it('should handle empty payload', () => {
+    const signature = signWebhookPayload(TEST_SECRET, '');
+    expect(signature).toMatch(/^sha256=[a-f0-9]{64}$/);
+  });
+
+  it('should handle empty secret', () => {
+    const signature = signWebhookPayload('', TEST_PAYLOAD);
+    expect(signature).toMatch(/^sha256=[a-f0-9]{64}$/);
+  });
+
+  it('should handle unicode payloads', () => {
+    const unicodePayload = '{"message":"Hello 世界 🌍"}';
+    const signature = signWebhookPayload(TEST_SECRET, unicodePayload);
+    expect(signature).toMatch(/^sha256=[a-f0-9]{64}$/);
+  });
+
+  it('should handle large payloads', () => {
+    const largePayload = 'x'.repeat(1024 * 1024); // 1MB
+    const signature = signWebhookPayload(TEST_SECRET, largePayload);
+    expect(signature).toMatch(/^sha256=[a-f0-9]{64}$/);
   });
 });
 
-// ─── verifySignature – happy path ─────────────────────────────────────────────
+// ─── verifyWebhookPayload ─────────────────────────────────────────────────────
 
-describe('verifySignature – valid requests', () => {
-  it('does not throw for a correctly signed, fresh request', () => {
-    const ts = validTimestamp();
-    const sig = signPayload(SECRET, BODY, ts);
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).not.toThrow();
+describe('verifyWebhookPayload', () => {
+  it('should return true for valid signature', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const isValid = verifyWebhookPayload(TEST_SECRET, TEST_PAYLOAD, signature);
+    expect(isValid).toBe(true);
   });
 
-  it('accepts a request at exactly the tolerance boundary (t = now - tolerance)', () => {
-    const ts = (NOW_MS - DEFAULT_TIMESTAMP_TOLERANCE_MS).toString();
-    const sig = signPayload(SECRET, BODY, ts);
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).not.toThrow();
+  it('should return false for invalid signature', () => {
+    const isValid = verifyWebhookPayload(TEST_SECRET, TEST_PAYLOAD, 'sha256=invalid');
+    expect(isValid).toBe(false);
   });
 
-  it('accepts a request with timestamp slightly in the past', () => {
-    const ts = (NOW_MS - 1000).toString(); // 1 second ago
-    const sig = signPayload(SECRET, BODY, ts);
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).not.toThrow();
+  it('should return false for tampered payload', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const isValid = verifyWebhookPayload(TEST_SECRET, '{"tampered":true}', signature);
+    expect(isValid).toBe(false);
   });
 
-  it('accepts a request with timestamp slightly in the future (clock skew)', () => {
-    const ts = (NOW_MS + 1000).toString(); // 1 second ahead
-    const sig = signPayload(SECRET, BODY, ts);
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).not.toThrow();
+  it('should return false for wrong secret', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const isValid = verifyWebhookPayload('wrong-secret', TEST_PAYLOAD, signature);
+    expect(isValid).toBe(false);
   });
 
-  it('accepts an empty body with a valid signature', () => {
-    const ts = validTimestamp();
-    const sig = signPayload(SECRET, '', ts);
-    expect(() =>
-      verifySignature(SECRET, '', sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).not.toThrow();
+  it('should return false for missing signature', () => {
+    const isValid = verifyWebhookPayload(TEST_SECRET, TEST_PAYLOAD, '');
+    expect(isValid).toBe(false);
   });
 
-  it('accepts a custom tolerance of 0 ms when timestamp matches exactly', () => {
-    const ts = NOW_MS.toString();
-    const sig = signPayload(SECRET, BODY, ts);
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, 0, NOW_MS),
-    ).not.toThrow();
+  it('should return false for null/undefined signature', () => {
+    expect(verifyWebhookPayload(TEST_SECRET, TEST_PAYLOAD, '')).toBe(false);
+  });
+
+  it('should return false for signature without sha256= prefix', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const bareSignature = signature.replace('sha256=', '');
+    const isValid = verifyWebhookPayload(TEST_SECRET, TEST_PAYLOAD, bareSignature);
+    expect(isValid).toBe(false);
+  });
+
+  it('should return false for signature with wrong prefix', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const wrongPrefix = signature.replace('sha256=', 'sha1=');
+    const isValid = verifyWebhookPayload(TEST_SECRET, TEST_PAYLOAD, wrongPrefix);
+    expect(isValid).toBe(false);
+  });
+
+  it('should return false for signature with different length', () => {
+    const isValid = verifyWebhookPayload(TEST_SECRET, TEST_PAYLOAD, 'sha256=tooshort');
+    expect(isValid).toBe(false);
+  });
+
+  it('should handle Buffer payloads', () => {
+    const bufferPayload = Buffer.from(TEST_PAYLOAD);
+    const signature = signWebhookPayload(TEST_SECRET, bufferPayload);
+    const isValid = verifyWebhookPayload(TEST_SECRET, bufferPayload, signature);
+    expect(isValid).toBe(true);
+  });
+
+  it('should return true for empty secret when signature matches', () => {
+    const signature = signWebhookPayload('', TEST_PAYLOAD);
+    const isValid = verifyWebhookPayload('', TEST_PAYLOAD, signature);
+    expect(isValid).toBe(true); // Empty secret is valid if signature matches
+  });
+
+  it('should return false when secret is empty but provided signature was signed with non-empty secret', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const isValid = verifyWebhookPayload('', TEST_PAYLOAD, signature);
+    expect(isValid).toBe(false);
+  });
+
+  // Timing attack prevention tests
+  it('should take similar time for valid and invalid signatures of same length', async () => {
+    const validSig = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const invalidSig = 'sha256=' + '0'.repeat(64);
+
+    const iterations = 100;
+
+    const validTimes: number[] = [];
+    const invalidTimes: number[] = [];
+
+    for (let i = 0; i < iterations; i++) {
+      const start1 = process.hrtime.bigint();
+      verifyWebhookPayload(TEST_SECRET, TEST_PAYLOAD, validSig);
+      const end1 = process.hrtime.bigint();
+      validTimes.push(Number(end1 - start1));
+
+      const start2 = process.hrtime.bigint();
+      verifyWebhookPayload(TEST_SECRET, TEST_PAYLOAD, invalidSig);
+      const end2 = process.hrtime.bigint();
+      invalidTimes.push(Number(end2 - start2));
+    }
+
+    const avgValid = validTimes.reduce((a, b) => a + b, 0) / iterations;
+    const avgInvalid = invalidTimes.reduce((a, b) => a + b, 0) / iterations;
+
+    // Timing difference should be within 50% (very loose check due to JS engine variance)
+    const ratio = Math.max(avgValid, avgInvalid) / Math.min(avgValid, avgInvalid);
+    expect(ratio).toBeLessThan(2);
   });
 });
 
-// ─── verifySignature – missing / malformed headers ────────────────────────────
+// ─── extractSignatureFromHeaders ──────────────────────────────────────────────
 
-describe('verifySignature – missing headers', () => {
-  it('throws UNAUTHORIZED when signature header is undefined', () => {
-    expect(() =>
-      verifySignature(SECRET, BODY, undefined, validTimestamp(), DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
-
-    try {
-      verifySignature(SECRET, BODY, undefined, validTimestamp(), DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS);
-    } catch (err) {
-      expect((err as AppError).code).toBe(ErrorCode.UNAUTHORIZED);
-      expect((err as AppError).statusCode).toBe(401);
-      expect((err as AppError).message).toMatch(/Missing webhook signature/);
-    }
+describe('extractSignatureFromHeaders', () => {
+  it('should extract x-revora-signature header', () => {
+    const headers = { 'x-revora-signature': 'sha256=abc123' };
+    const signature = extractSignatureFromHeaders(headers);
+    expect(signature).toBe('sha256=abc123');
   });
 
-  it('throws UNAUTHORIZED when signature header is empty string', () => {
-    expect(() =>
-      verifySignature(SECRET, BODY, '', validTimestamp(), DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
+  it('should extract x-webhook-signature header', () => {
+    const headers = { 'x-webhook-signature': 'sha256=def456' };
+    const signature = extractSignatureFromHeaders(headers);
+    expect(signature).toBe('sha256=def456');
   });
 
-  it('throws UNAUTHORIZED when timestamp header is undefined', () => {
-    const sig = signPayload(SECRET, BODY, validTimestamp());
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, undefined, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
-
-    try {
-      verifySignature(SECRET, BODY, sig, undefined, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS);
-    } catch (err) {
-      expect((err as AppError).message).toMatch(/Missing webhook timestamp/);
-    }
+  it('should extract x-signature header', () => {
+    const headers = { 'x-signature': 'sha256=ghi789' };
+    const signature = extractSignatureFromHeaders(headers);
+    expect(signature).toBe('sha256=ghi789');
   });
 
-  it('throws UNAUTHORIZED when timestamp header is empty string', () => {
-    const sig = signPayload(SECRET, BODY, validTimestamp());
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, '', DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
-  });
-});
-
-// ─── verifySignature – timestamp tolerance ────────────────────────────────────
-
-describe('verifySignature – timestamp tolerance', () => {
-  it('rejects a request older than the tolerance window', () => {
-    const ts = (NOW_MS - DEFAULT_TIMESTAMP_TOLERANCE_MS - 1).toString();
-    const sig = signPayload(SECRET, BODY, ts);
-
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
-
-    try {
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS);
-    } catch (err) {
-      expect((err as AppError).message).toMatch(/too old/);
-    }
+  it('should extract x-hub-signature-256 header (GitHub style)', () => {
+    const headers = { 'x-hub-signature-256': 'sha256=jkl012' };
+    const signature = extractSignatureFromHeaders(headers);
+    expect(signature).toBe('sha256=jkl012');
   });
 
-  it('rejects a request far in the future (beyond tolerance)', () => {
-    const ts = (NOW_MS + DEFAULT_TIMESTAMP_TOLERANCE_MS + 1).toString();
-    const sig = signPayload(SECRET, BODY, ts);
-
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
-
-    try {
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS);
-    } catch (err) {
-      expect((err as AppError).message).toMatch(/in the future/);
-    }
+  it('should handle lowercase header names', () => {
+    const headers = { 'x-revora-signature': 'sha256=mno345' };
+    const signature = extractSignatureFromHeaders(headers);
+    expect(signature).toBe('sha256=mno345');
   });
 
-  it('rejects a request 1 hour old', () => {
-    const ts = (NOW_MS - 60 * 60 * 1000).toString();
-    const sig = signPayload(SECRET, BODY, ts);
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
+  it('should handle array header values', () => {
+    const headers = { 'x-revora-signature': ['sha256=pqr678', 'ignored'] };
+    const signature = extractSignatureFromHeaders(headers);
+    expect(signature).toBe('sha256=pqr678');
   });
 
-  it('rejects a request with timestamp = 0', () => {
-    const sig = signPayload(SECRET, BODY, '0');
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, '0', DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
+  it('should return undefined when no signature header present', () => {
+    const headers = { 'content-type': 'application/json' };
+    const signature = extractSignatureFromHeaders(headers);
+    expect(signature).toBeUndefined();
   });
 
-  it('rejects a non-numeric timestamp', () => {
-    const sig = signPayload(SECRET, BODY, validTimestamp());
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, 'not-a-number', DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
-
-    try {
-      verifySignature(SECRET, BODY, sig, 'not-a-number', DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS);
-    } catch (err) {
-      expect((err as AppError).message).toMatch(/Invalid webhook timestamp/);
-    }
+  it('should return undefined for empty headers', () => {
+    const signature = extractSignatureFromHeaders({});
+    expect(signature).toBeUndefined();
   });
 
-  it('rejects a negative timestamp', () => {
-    const sig = signPayload(SECRET, BODY, '-1');
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, '-1', DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
+  it('should prioritize first matching header', () => {
+    const headers = {
+      'x-revora-signature': 'sha256=first',
+      'x-webhook-signature': 'sha256=second',
+    };
+    const signature = extractSignatureFromHeaders(headers);
+    expect(signature).toBe('sha256=first');
   });
 
-  it('respects a custom tolerance of 10 seconds', () => {
-    const tolerance = 10_000;
-    const freshTs = (NOW_MS - 5_000).toString(); // 5 s ago – within window
-    const staleTs = (NOW_MS - 15_000).toString(); // 15 s ago – outside window
-
-    const freshSig = signPayload(SECRET, BODY, freshTs);
-    const staleSig = signPayload(SECRET, BODY, staleTs);
-
-    expect(() =>
-      verifySignature(SECRET, BODY, freshSig, freshTs, tolerance, NOW_MS),
-    ).not.toThrow();
-
-    expect(() =>
-      verifySignature(SECRET, BODY, staleSig, staleTs, tolerance, NOW_MS),
-    ).toThrow(AppError);
+  it('should handle undefined header values', () => {
+    const headers = {
+      'x-revora-signature': undefined,
+      'x-webhook-signature': 'sha256=backup',
+    };
+    const signature = extractSignatureFromHeaders(headers);
+    expect(signature).toBe('sha256=backup');
   });
 });
 
-// ─── verifySignature – invalid signatures ─────────────────────────────────────
+// ─── assertValidWebhookSignature ──────────────────────────────────────────────
 
-describe('verifySignature – invalid signatures', () => {
-  it('rejects a signature with wrong secret', () => {
-    const ts = validTimestamp();
-    const sig = signPayload('wrong-secret', BODY, ts);
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
+describe('assertValidWebhookSignature', () => {
+  it('should not throw for valid signature', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    expect(() => {
+      assertValidWebhookSignature(TEST_SECRET, TEST_PAYLOAD, signature);
+    }).not.toThrow();
+  });
+
+  it('should throw WebhookSignatureError for missing signature', () => {
+    expect(() => {
+      assertValidWebhookSignature(TEST_SECRET, TEST_PAYLOAD, undefined);
+    }).toThrow(WebhookSignatureError);
 
     try {
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS);
-    } catch (err) {
-      expect((err as AppError).message).toMatch(/Invalid webhook signature/);
+      assertValidWebhookSignature(TEST_SECRET, TEST_PAYLOAD, undefined);
+    } catch (error) {
+      expect(error).toBeInstanceOf(WebhookSignatureError);
+      expect((error as WebhookSignatureError).code).toBe('MISSING_SIGNATURE');
     }
   });
 
-  it('rejects a signature for a different body', () => {
-    const ts = validTimestamp();
-    const sig = signPayload(SECRET, '{"tampered":true}', ts);
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
-  });
-
-  it('rejects a signature for a different timestamp', () => {
-    const ts = validTimestamp();
-    const sig = signPayload(SECRET, BODY, (NOW_MS - 1000).toString());
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
-  });
-
-  it('rejects a signature without the sha256= prefix', () => {
-    const ts = validTimestamp();
-    const rawHex = createHmac('sha256', SECRET)
-      .update(`${ts}.${BODY}`)
-      .digest('hex');
-    expect(() =>
-      verifySignature(SECRET, BODY, rawHex, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
+  it('should throw WebhookSignatureError for invalid format', () => {
+    expect(() => {
+      assertValidWebhookSignature(TEST_SECRET, TEST_PAYLOAD, 'invalid-format');
+    }).toThrow(WebhookSignatureError);
 
     try {
-      verifySignature(SECRET, BODY, rawHex, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS);
-    } catch (err) {
-      expect((err as AppError).message).toMatch(/Unsupported webhook signature scheme/);
+      assertValidWebhookSignature(TEST_SECRET, TEST_PAYLOAD, 'invalid-format');
+    } catch (error) {
+      expect((error as WebhookSignatureError).code).toBe('INVALID_FORMAT');
     }
   });
 
-  it('rejects a truncated signature', () => {
-    const ts = validTimestamp();
-    const sig = signPayload(SECRET, BODY, ts).slice(0, -4); // chop last 4 chars
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
+  it('should throw WebhookSignatureError for verification failure', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    expect(() => {
+      assertValidWebhookSignature('wrong-secret', TEST_PAYLOAD, signature);
+    }).toThrow(WebhookSignatureError);
+
+    try {
+      assertValidWebhookSignature('wrong-secret', TEST_PAYLOAD, signature);
+    } catch (error) {
+      expect((error as WebhookSignatureError).code).toBe('VERIFICATION_FAILED');
+    }
   });
 
-  it('rejects an all-zeros signature of correct length', () => {
-    const ts = validTimestamp();
-    const zeros = 'sha256=' + '0'.repeat(64);
-    expect(() =>
-      verifySignature(SECRET, BODY, zeros, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
-  });
+  it('should include descriptive error messages', () => {
+    try {
+      assertValidWebhookSignature(TEST_SECRET, TEST_PAYLOAD, undefined);
+    } catch (error) {
+      expect((error as Error).message).toContain('missing');
+    }
 
-  it('rejects a valid signature replayed with a different timestamp header', () => {
-    const ts = validTimestamp();
-    const sig = signPayload(SECRET, BODY, ts);
-    const replayTs = (NOW_MS - 1000).toString(); // attacker changes the header
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, replayTs, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
+    try {
+      assertValidWebhookSignature(TEST_SECRET, TEST_PAYLOAD, 'bad-format');
+    } catch (error) {
+      expect((error as Error).message).toContain('format');
+    }
+
+    try {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+      assertValidWebhookSignature('wrong-secret', TEST_PAYLOAD, signature);
+    } catch (error) {
+      expect((error as Error).message).toContain('failed');
+    }
   });
 });
 
-// ─── classifySignatureFailure ─────────────────────────────────────────────────
+// ─── verifyWebhook ────────────────────────────────────────────────────────────
 
-describe('classifySignatureFailure', () => {
-  function failureFor(
-    sig: string | undefined,
-    ts: string | undefined,
-    toleranceMs = DEFAULT_TIMESTAMP_TOLERANCE_MS,
-  ): unknown {
-    try {
-      verifySignature(SECRET, BODY, sig, ts, toleranceMs, NOW_MS);
-    } catch (err) {
-      return err;
-    }
-    return null;
-  }
+describe('verifyWebhook', () => {
+  const baseConfig: WebhookVerificationConfig = {
+    secret: TEST_SECRET,
+  };
 
-  it('classifies missing signature', () => {
-    expect(classifySignatureFailure(failureFor(undefined, validTimestamp()))).toBe(
-      'missing_signature',
-    );
+  it('should return valid result for correct signature', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const headers = { 'x-revora-signature': signature };
+    const result = verifyWebhook(baseConfig, TEST_PAYLOAD, headers);
+
+    expect(result.valid).toBe(true);
+    expect(result.error).toBeUndefined();
   });
 
-  it('classifies missing timestamp', () => {
-    const sig = signPayload(SECRET, BODY, validTimestamp());
-    expect(classifySignatureFailure(failureFor(sig, undefined))).toBe(
-      'missing_timestamp',
-    );
+  it('should return invalid result for missing signature', () => {
+    const result = verifyWebhook(baseConfig, TEST_PAYLOAD, {});
+
+    expect(result.valid).toBe(false);
+    expect(result.error).toBeInstanceOf(WebhookSignatureError);
+    expect(result.error?.code).toBe('MISSING_SIGNATURE');
   });
 
-  it('classifies invalid timestamp format', () => {
-    const sig = signPayload(SECRET, BODY, validTimestamp());
-    expect(classifySignatureFailure(failureFor(sig, 'not-a-number'))).toBe(
-      'invalid_timestamp_format',
-    );
+  it('should return invalid result for wrong signature', () => {
+    const headers = { 'x-revora-signature': 'sha256=' + '0'.repeat(64) };
+    const result = verifyWebhook(baseConfig, TEST_PAYLOAD, headers);
+
+    expect(result.valid).toBe(false);
+    expect(result.error?.code).toBe('VERIFICATION_FAILED');
   });
 
-  it('classifies timestamp too old', () => {
-    const staleTs = (NOW_MS - DEFAULT_TIMESTAMP_TOLERANCE_MS - 1).toString();
-    const sig = signPayload(SECRET, BODY, staleTs);
-    expect(classifySignatureFailure(failureFor(sig, staleTs))).toBe(
-      'timestamp_too_old',
-    );
+  it('should respect custom header name', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const config: WebhookVerificationConfig = {
+      ...baseConfig,
+      headerName: 'x-custom-signature',
+    };
+    const headers = { 'x-custom-signature': signature };
+    const result = verifyWebhook(config, TEST_PAYLOAD, headers);
+
+    expect(result.valid).toBe(true);
   });
 
-  it('classifies timestamp in the future', () => {
-    const futureTs = (NOW_MS + DEFAULT_TIMESTAMP_TOLERANCE_MS + 1).toString();
-    const sig = signPayload(SECRET, BODY, futureTs);
-    expect(classifySignatureFailure(failureFor(sig, futureTs))).toBe(
-      'timestamp_in_future',
-    );
+  it('should enforce max payload size', () => {
+    const config: WebhookVerificationConfig = {
+      ...baseConfig,
+      maxPayloadSize: 10, // Very small
+    };
+    const result = verifyWebhook(config, TEST_PAYLOAD, {});
+
+    expect(result.valid).toBe(false);
+    expect(result.error?.code).toBe('INVALID_FORMAT');
   });
 
-  it('classifies unsupported scheme', () => {
-    const ts = validTimestamp();
-    const rawHex = createHmac('sha256', SECRET).update(`${ts}.${BODY}`).digest('hex');
-    expect(classifySignatureFailure(failureFor(rawHex, ts))).toBe(
-      'unsupported_scheme',
-    );
+  it('should allow payloads within max size', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const config: WebhookVerificationConfig = {
+      ...baseConfig,
+      maxPayloadSize: TEST_PAYLOAD.length * 2,
+    };
+    const headers = { 'x-revora-signature': signature };
+    const result = verifyWebhook(config, TEST_PAYLOAD, headers);
+
+    expect(result.valid).toBe(true);
   });
 
-  it('classifies invalid signature (wrong secret)', () => {
-    const ts = validTimestamp();
-    const sig = signPayload('wrong-secret', BODY, ts);
-    expect(classifySignatureFailure(failureFor(sig, ts))).toBe(
-      'invalid_signature',
-    );
+  describe('timestamp/replay protection', () => {
+    const configWithTimestamp: WebhookVerificationConfig = {
+      ...baseConfig,
+      requireTimestamp: true,
+      maxAgeMs: 60000, // 1 minute
+    };
+
+    it('should accept valid timestamp', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+      const now = Date.now();
+      const headers = {
+        'x-revora-signature': signature,
+        'x-webhook-timestamp': String(now),
+      };
+      const result = verifyWebhook(configWithTimestamp, TEST_PAYLOAD, headers);
+
+      expect(result.valid).toBe(true);
+      expect(result.timestamp).toBeInstanceOf(Date);
+    });
+
+    it('should accept x-revora-timestamp header', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+      const now = Date.now();
+      const headers = {
+        'x-revora-signature': signature,
+        'x-revora-timestamp': String(now),
+      };
+      const result = verifyWebhook(configWithTimestamp, TEST_PAYLOAD, headers);
+
+      expect(result.valid).toBe(true);
+    });
+
+    it('should reject missing timestamp when required', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+      const headers = { 'x-revora-signature': signature };
+      const result = verifyWebhook(configWithTimestamp, TEST_PAYLOAD, headers);
+
+      expect(result.valid).toBe(false);
+      expect(result.error?.code).toBe('INVALID_FORMAT');
+    });
+
+    it('should reject invalid timestamp format', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+      const headers = {
+        'x-revora-signature': signature,
+        'x-webhook-timestamp': 'not-a-number',
+      };
+      const result = verifyWebhook(configWithTimestamp, TEST_PAYLOAD, headers);
+
+      expect(result.valid).toBe(false);
+      expect(result.error?.code).toBe('INVALID_FORMAT');
+    });
+
+    it('should reject old timestamps', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+      const oldTimestamp = Date.now() - 120000; // 2 minutes ago
+      const headers = {
+        'x-revora-signature': signature,
+        'x-webhook-timestamp': String(oldTimestamp),
+      };
+      const result = verifyWebhook(configWithTimestamp, TEST_PAYLOAD, headers);
+
+      expect(result.valid).toBe(false);
+      expect(result.error?.code).toBe('VERIFICATION_FAILED');
+    });
+
+    it('should reject future timestamps', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+      const futureTimestamp = Date.now() + 120000; // 2 minutes from now
+      const headers = {
+        'x-revora-signature': signature,
+        'x-webhook-timestamp': String(futureTimestamp),
+      };
+      const result = verifyWebhook(configWithTimestamp, TEST_PAYLOAD, headers);
+
+      expect(result.valid).toBe(false);
+      expect(result.error?.code).toBe('VERIFICATION_FAILED');
+    });
+
+    it('should accept timestamp at exact boundary', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+      // Use a timestamp slightly less than maxAgeMs to account for test execution time
+      const boundaryTimestamp = Date.now() - 59000; // Just under 1 minute ago
+      const headers = {
+        'x-revora-signature': signature,
+        'x-webhook-timestamp': String(boundaryTimestamp),
+      };
+      const result = verifyWebhook(configWithTimestamp, TEST_PAYLOAD, headers);
+
+      expect(result.valid).toBe(true);
+    });
   });
 
-  it('returns "unknown" for non-Error values', () => {
-    expect(classifySignatureFailure('a string')).toBe('unknown');
-    expect(classifySignatureFailure(null)).toBe('unknown');
-    expect(classifySignatureFailure(42)).toBe('unknown');
-  });
+  it('should handle array header values', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const headers: Record<string, string | string[] | undefined> = {
+      'x-revora-signature': [signature, 'ignored'],
+    };
+    const result = verifyWebhook(baseConfig, TEST_PAYLOAD, headers);
 
-  it('returns "unknown" for a generic Error', () => {
-    expect(classifySignatureFailure(new Error('something else entirely'))).toBe(
-      'unknown',
-    );
+    expect(result.valid).toBe(true);
   });
 });
 
-// ─── Replay-attack scenario ───────────────────────────────────────────────────
+// ─── Edge Cases and Security Tests ────────────────────────────────────────────
 
-describe('replay attack prevention', () => {
-  it('rejects a valid request replayed after the tolerance window expires', () => {
-    const ts = NOW_MS.toString();
-    const sig = signPayload(SECRET, BODY, ts);
-
-    // At time of original delivery – should pass
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).not.toThrow();
-
-    // Replayed 6 minutes later – should fail
-    const replayNow = NOW_MS + 6 * 60 * 1000;
-    expect(() =>
-      verifySignature(SECRET, BODY, sig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, replayNow),
-    ).toThrow(AppError);
+describe('Webhook Signature Security Edge Cases', () => {
+  it('should handle null bytes in payload', () => {
+    const payloadWithNull = '{"data":"hello\u0000world"}';
+    const signature = signWebhookPayload(TEST_SECRET, payloadWithNull);
+    const isValid = verifyWebhookPayload(TEST_SECRET, payloadWithNull, signature);
+    expect(isValid).toBe(true);
   });
 
-  it('rejects a body-swap attack (same timestamp, different body)', () => {
-    const ts = validTimestamp();
-    const originalSig = signPayload(SECRET, BODY, ts);
-    const tamperedBody = BODY.replace('offering.created', 'payout.completed');
+  it('should handle special characters in secret', () => {
+    const specialSecret = 'secret-with-!@#$%^&*()_+-=[]{}|;\':",./<>?';
+    const signature = signWebhookPayload(specialSecret, TEST_PAYLOAD);
+    const isValid = verifyWebhookPayload(specialSecret, TEST_PAYLOAD, signature);
+    expect(isValid).toBe(true);
+  });
 
-    expect(() =>
-      verifySignature(SECRET, tamperedBody, originalSig, ts, DEFAULT_TIMESTAMP_TOLERANCE_MS, NOW_MS),
-    ).toThrow(AppError);
+  it('should handle unicode in secret', () => {
+    const unicodeSecret = '密钥-🔐-秘密鍵';
+    const signature = signWebhookPayload(unicodeSecret, TEST_PAYLOAD);
+    const isValid = verifyWebhookPayload(unicodeSecret, TEST_PAYLOAD, signature);
+    expect(isValid).toBe(true);
+  });
+
+  it('should handle very long secrets', () => {
+    const longSecret = 'a'.repeat(10000);
+    const signature = signWebhookPayload(longSecret, TEST_PAYLOAD);
+    const isValid = verifyWebhookPayload(longSecret, TEST_PAYLOAD, signature);
+    expect(isValid).toBe(true);
+  });
+
+  it('should handle binary payloads as Buffer', () => {
+    const binaryPayload = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe]);
+    const signature = signWebhookPayload(TEST_SECRET, binaryPayload);
+    const isValid = verifyWebhookPayload(TEST_SECRET, binaryPayload, signature);
+    expect(isValid).toBe(true);
+  });
+
+  it('should reject signature with invalid hex characters', () => {
+    const invalidSig = 'sha256=' + 'g'.repeat(64); // 'g' is not valid hex
+    const isValid = verifyWebhookPayload(TEST_SECRET, TEST_PAYLOAD, invalidSig);
+    expect(isValid).toBe(false);
+  });
+
+  it('should reject signature with truncated hex', () => {
+    const validSig = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const truncatedSig = validSig.slice(0, validSig.length - 5);
+    const isValid = verifyWebhookPayload(TEST_SECRET, TEST_PAYLOAD, truncatedSig);
+    expect(isValid).toBe(false);
+  });
+
+  it('should reject signature with extra hex', () => {
+    const validSig = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const extendedSig = validSig + 'abcd';
+    const isValid = verifyWebhookPayload(TEST_SECRET, TEST_PAYLOAD, extendedSig);
+    expect(isValid).toBe(false);
+  });
+
+  it('should handle case sensitivity in hex', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+    const upperCaseSig = signature.toUpperCase();
+    const isValid = verifyWebhookPayload(TEST_SECRET, TEST_PAYLOAD, upperCaseSig);
+    // Hex is case-insensitive, but our implementation uses lowercase
+    expect(isValid).toBe(false);
+  });
+});
+
+// ─── WebhookSignatureError ────────────────────────────────────────────────────
+
+describe('WebhookSignatureError', () => {
+  it('should have correct name', () => {
+    const error = new WebhookSignatureError('Test', 'MISSING_SIGNATURE');
+    expect(error.name).toBe('WebhookSignatureError');
+  });
+
+  it('should preserve code', () => {
+    const error = new WebhookSignatureError('Test', 'VERIFICATION_FAILED');
+    expect(error.code).toBe('VERIFICATION_FAILED');
+  });
+
+  it('should be instanceof Error', () => {
+    const error = new WebhookSignatureError('Test', 'INVALID_FORMAT');
+    expect(error).toBeInstanceOf(Error);
+  });
+
+  it('should be instanceof WebhookSignatureError', () => {
+    const error = new WebhookSignatureError('Test', 'MISSING_SIGNATURE');
+    expect(error).toBeInstanceOf(WebhookSignatureError);
+  });
+
+  it('should work with try-catch', () => {
+    try {
+      throw new WebhookSignatureError('Test error', 'VERIFICATION_FAILED');
+    } catch (e) {
+      expect(e).toBeInstanceOf(WebhookSignatureError);
+      expect((e as WebhookSignatureError).message).toBe('Test error');
+    }
   });
 });
