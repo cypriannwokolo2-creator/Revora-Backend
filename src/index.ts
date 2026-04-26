@@ -1,21 +1,14 @@
-import "dotenv/config";
-import express, {
-  NextFunction,
-  Request,
-  RequestHandler,
-  Response,
-} from "express";
-import morgan from "morgan";
-import { closePool, dbHealth, query as dbQuery } from "./db/client";
-import { createCorsMiddleware } from "./middleware/cors";
-import { errorHandler } from "./middleware/errorHandler";
-import { requestIdMiddleware } from "./middleware/requestId";
-import { Errors } from "./lib/errors";
-import {
-  classifyStellarRPCFailure,
-  StellarRPCFailureClass,
-} from "./lib/stellarRpcFailure";
-import { createHealthRouter } from "./routes/health";
+import 'dotenv/config';
+import express, { NextFunction, Request, RequestHandler, Response } from 'express';
+import morgan from 'morgan';
+import { closePool, dbHealth, query as dbQuery } from './db/client';
+import { createCorsMiddleware } from './middleware/cors';
+import { errorHandler } from './middleware/errorHandler';
+import { requestIdMiddleware } from './middleware/requestId';
+import { Errors } from './lib/errors';
+import { classifyStellarRPCFailure, StellarRPCFailureClass } from './lib/stellarRpcFailure';
+import { createHealthRouter } from './routes/health';
+import vestingRouter from './routes/vesting';
 
 const port = process.env.PORT ?? 3000;
 const API_VERSION_PREFIX = process.env.API_VERSION_PREFIX ?? "/api/v1";
@@ -636,8 +629,11 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   apiRouter.post(
     "/offerings/validation-matrix",
     requireOfferingAuth,
+    offeringSanitizeMiddleware,
     createOfferingValidationHandler(),
   );
+
+  apiRouter.use('/vesting', vestingRouter);
 
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));

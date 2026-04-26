@@ -1,5 +1,7 @@
-import { NextFunction, Request, Response, Router } from "express";
-import { AppError, Errors } from "../lib/errors";
+import { NextFunction, Request, Response, Router } from 'express';
+import { Pool } from 'pg';
+import { AppError, Errors } from '../lib/errors';
+import { MetricsCollector } from '../lib/metrics';
 import {
   classifyStellarRPCFailure,
   StellarRPCFailureClass,
@@ -274,35 +276,16 @@ export const healthRootHandler =
   };
 
 export const healthReadyHandler =
-  (dbHealth: DbHealthChecker) =>
-  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const requestId = req.headers["x-request-id"] as string | undefined;
+  (db: QueryableDb, metrics?: MetricsCollector) =>
+  async (_req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const startTime = Date.now();
 
-    const [dbCheck, stellarCheck] = await Promise.all([
-      checkDatabase(dbHealth),
-      checkStellarHorizon(),
-    ]);
-
-    const allHealthy = dbCheck.healthy && stellarCheck.healthy;
-
-    if (!allHealthy) {
-      const failedDependency = !dbCheck.healthy
-        ? "database"
-        : "stellar-horizon";
-      const cause = !dbCheck.healthy
-        ? new Error(dbCheck.error)
-        : { status: stellarCheck.details?.upstreamStatus ?? 503 };
-
-      logHealthCheck("warn", "Readiness probe failed", {
-        dependency: failedDependency,
-        dbStatus: dbCheck.status,
-        stellarStatus: stellarCheck.status,
-        requestId,
-      });
-
-      next(
-        mapHealthDependencyFailure(failedDependency as HealthDependency, cause),
-      );
+    try {
+      await db.query('SELECT 1');
+      metrics?.incrementCounter('health_checks_total', { check: 'database', status: 'success' });
+    } catch (dbError) {
+      metrics?.incrementCounter('health_checks_total', { check: 'database', status: 'failure' });
+      next(mapHealthDependencyFailure('database', dbError));
       return;
     }
 
@@ -311,53 +294,20 @@ export const healthReadyHandler =
       latencyMs: Math.max(dbCheck.latencyMs, stellarCheck.latencyMs),
     });
 
-    res.status(200).json({
-      ready: true,
-      service: "revora-backend",
-      timestamp: new Date().toISOString(),
-      checks: [dbCheck.name, stellarCheck.name],
-      requestId,
-    });
-  };
-
-export const healthLiveHandler =
-  () =>
-  async (req: Request, res: Response): Promise<void> => {
-    const requestId = req.headers["x-request-id"] as string | undefined;
-
-    logHealthCheck("info", "Liveness probe passed", { requestId });
-
-    res.status(200).json({
-      alive: true,
-      service: "revora-backend",
-      timestamp: new Date().toISOString(),
-      uptime: getUptimeSeconds(),
-      requestId,
-    });
-  };
-
-export const healthStartupHandler =
-  (dbHealth: DbHealthChecker) =>
-  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const requestId = req.headers["x-request-id"] as string | undefined;
-
-    const dbCheck = await checkDatabase(dbHealth);
-
-    if (!dbCheck.healthy) {
-      logHealthCheck("warn", "Startup probe failed", {
-        dependency: "database",
-        status: dbCheck.status,
-        requestId,
-      });
-
-      next(mapHealthDependencyFailure("database", new Error(dbCheck.error)));
+      if (!response.ok) {
+        metrics?.incrementCounter('health_checks_total', { check: 'stellar-horizon', status: 'failure' });
+        next(mapHealthDependencyFailure('stellar-horizon', { status: response.status }));
+        return;
+      }
+      metrics?.incrementCounter('health_checks_total', { check: 'stellar-horizon', status: 'success' });
+    } catch (stellarError) {
+      metrics?.incrementCounter('health_checks_total', { check: 'stellar-horizon', status: 'failure' });
+      next(mapHealthDependencyFailure('stellar-horizon', stellarError));
       return;
     }
 
-    logHealthCheck("info", "Startup probe passed", {
-      requestId,
-      latencyMs: dbCheck.latencyMs,
-    });
+    const duration = Date.now() - startTime;
+    metrics?.recordHistogram('health_check_duration_ms', duration, { endpoint: 'ready' });
 
     res.status(200).json({
       ready: true,
@@ -368,14 +318,9 @@ export const healthStartupHandler =
     });
   };
 
-export const createHealthRouter = (dbHealth: DbHealthChecker): Router => {
+export const createHealthRouter = (db: QueryableDb, metrics?: MetricsCollector): Router => {
   const router = Router();
-
-  router.get("/", healthRootHandler(dbHealth));
-  router.get("/live", healthLiveHandler());
-  router.get("/ready", healthReadyHandler(dbHealth));
-  router.get("/startup", healthStartupHandler(dbHealth));
-
+  router.get('/ready', healthReadyHandler(db, metrics));
   return router;
 };
 
